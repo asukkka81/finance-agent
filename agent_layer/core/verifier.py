@@ -40,6 +40,105 @@ def format_tool_results_text(tool_results: list, max_chars: int = 3000) -> str:
     return "\n".join(parts)[:max_chars]
 
 
+# ================================================================
+# 完整性校验: 实体提取 & 需求清单 (规则模式)
+# ================================================================
+
+# 常见指标/缩写 — 避免被误提取为美股股票代码
+_STOCK_CODE_STOPWORDS = frozenset({
+    "PE", "PB", "ROE", "ROA", "EPS", "CPI", "PMI", "GDP", "M2", "LPR",
+    "AI", "ETF", "IPO", "MACD", "RSI", "OHLCV",
+})
+
+# 常见股票中文名 → 代码 (实体提取用)
+_STOCK_NAME_MAP = {
+    "贵州茅台": "600519", "茅台": "600519", "五粮液": "000858",
+    "宁德时代": "300750", "比亚迪": "002594", "招商银行": "600036",
+    "中国平安": "601318", "平安银行": "000001", "美的集团": "000333",
+    "恒瑞医药": "600276", "紫金矿业": "601899",
+    "苹果": "AAPL", "微软": "MSFT", "特斯拉": "TSLA", "英伟达": "NVDA",
+    "谷歌": "GOOGL", "亚马逊": "AMZN",
+}
+
+# 需求清单: 查询关键词 → (需求名, 回答/数据中的覆盖关键词)
+_REQUIREMENT_PATTERNS: dict[str, tuple[list[str], list[str]]] = {
+    "估值水平": (
+        ["估值", "市盈率", "PE", "市净率", "PB", "分位"],
+        ["估值", "市盈率", "PE", "市净率", "PB", "分位", "倍"],
+    ),
+    "行业地位": (
+        ["行业", "地位", "份额", "排名", "竞争", "龙头"],
+        ["行业", "地位", "份额", "排名", "竞争", "龙头"],
+    ),
+    "对比分析": (
+        ["对比", "比较", "相比", "区别", "哪个", "谁更", "vs"],
+        ["对比", "相比", "高于", "低于", "优于", "区别", "vs"],
+    ),
+    "投资价值": (
+        ["投资", "值得", "建仓", "买入", "价值"],
+        ["投资", "价值", "回报", "收益", "值得", "买入", "持有"],
+    ),
+    "行情数据": (
+        ["价格", "股价", "行情", "走势", "涨", "跌", "收盘", "现价", "多少"],
+        ["价格", "收盘", "涨", "跌", "元", "点", "%"],
+    ),
+    "风险分析": (
+        ["风险", "回撤", "波动"],
+        ["风险", "回撤", "波动"],
+    ),
+    "基本面": (
+        ["基本面", "财务", "营收", "利润", "ROE", "ROA"],
+        ["营收", "利润", "ROE", "ROA", "基本面", "毛利率"],
+    ),
+    "宏观数据": (
+        ["宏观", "CPI", "PMI", "GDP", "M2", "通胀", "利率"],
+        ["CPI", "PMI", "GDP", "M2", "通胀", "利率"],
+    ),
+}
+
+
+def extract_query_entities(query: str) -> list[dict]:
+    """从查询中提取关键实体 (股票代码/中文名).
+
+    Returns:
+        [{"name": 实体显示名, "code": 代码}, ...] — 同名代码去重.
+    """
+    entities: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(name: str, code: str) -> None:
+        if code not in seen:
+            seen.add(code)
+            entities.append({"name": name, "code": code})
+
+    # A股 6 位数字代码
+    for code in re.findall(r"\b(\d{6})\b", query):
+        _add(code, code)
+
+    # 中文股票名 (先匹配长名, 保证显示名更精确)
+    for name, code in sorted(_STOCK_NAME_MAP.items(), key=lambda kv: -len(kv[0])):
+        if name in query:
+            _add(name, code)
+
+    # 美股代码 (2-5 位大写, 排除指标缩写)
+    for ticker in re.findall(r"\b([A-Z]{2,5})\b", query):
+        if ticker not in _STOCK_CODE_STOPWORDS:
+            _add(ticker, ticker)
+
+    return entities
+
+
+def _entity_covered(entity: dict, text: str) -> bool:
+    """实体是否在答案/工具结果文本中被提及 (代码或任一中文名)."""
+    if entity["code"] in text:
+        return True
+    return any(
+        name in text
+        for name, code in _STOCK_NAME_MAP.items()
+        if code == entity["code"]
+    )
+
+
 class Verdict(str, Enum):
     PASS = "pass"         # 通过
     NEEDS_MORE = "needs_more"  # 信息不足，需要补充查询
@@ -152,11 +251,13 @@ class Verifier:
         """
         dimensions = []
 
-        # LLM judge: 一次调用同时评审准确性 + 逻辑性
+        # LLM judge: 一次调用同时评审完整性 + 准确性 + 逻辑性
         judge = self._llm_judge(query, answer, tool_results)
 
         # 完整性
-        dimensions.append(self._check_completeness(query, tool_results, intent_type))
+        dimensions.append(self._check_completeness(
+            query, tool_results, intent_type, answer=answer, judge=judge,
+        ))
 
         # 准确性
         dimensions.append(self._check_accuracy(answer, tool_results, judge))
@@ -186,68 +287,176 @@ class Verifier:
     # ================================================================
 
     def _check_completeness(
-        self, query: str, tool_results: list, intent_type: str
+        self,
+        query: str,
+        tool_results: list,
+        intent_type: str,
+        answer: str = "",
+        judge: Optional[dict] = None,
     ) -> DimensionResult:
-        """检查信息完整性."""
-        issues = []
-        suggestions = []
+        """检查信息完整性.
 
-        # 检查工具结果中包含的数据类型
-        has_price_data = any(
-            "get_stock_price" in str(r.get("tool_name", ""))
-            for r in tool_results
+        启用 LLM judge 且返回 completeness_score 时直接采用;
+        否则规则校验, 三重检查:
+            1. 实体覆盖: 查询中的股票代码/名称是否都在答案中被提及
+            2. 需求清单: 查询关键词推导出的需求 (估值/行业/对比/投资...)
+               是否都被回答
+            3. 数据类型: 意图所需的数据类型是否已获取 (驱动补充查询)
+
+        评分 = 0.5 * 实体覆盖率 + 0.5 * 需求覆盖率 - 0.2 * 缺失数据类型数
+        """
+        # LLM judge 模式
+        if judge is not None and isinstance(judge.get("completeness_score"), (int, float)):
+            score = self._clamp_score(judge.get("completeness_score"))
+            missing = self._str_list(judge.get("missing_items"))
+            return DimensionResult(
+                dimension="completeness",
+                verdict=self._verdict_from_score(score),
+                score=score,
+                issues=missing[:5] or self._str_list(judge.get("issues"))[:5],
+            )
+
+        issues: list[str] = []
+        suggestions: list[dict] = []
+        context_text = f"{answer}\n{format_tool_results_text(tool_results)}"
+
+        # 1. 实体覆盖检查
+        entities = extract_query_entities(query)
+        missing_entities = [
+            e["name"] for e in entities if not _entity_covered(e, context_text)
+        ]
+        entity_score = (
+            (len(entities) - len(missing_entities)) / len(entities)
+            if entities else 1.0
         )
-        has_knowledge = any(
-            "search_knowledge" in str(r.get("tool_name", ""))
-            for r in tool_results
+        if missing_entities:
+            issues.append(f"缺少实体分析: {', '.join(missing_entities)}")
+
+        # 2. 需求清单检查
+        requirements = self._extract_requirements(query)
+        missing_requirements = [
+            req_name
+            for req_name, answer_kws in requirements.items()
+            if not any(kw in context_text for kw in answer_kws)
+        ]
+
+        # 3. 数据类型覆盖检查 (原规则, 驱动补充查询)
+        data_missing, data_flags = self._check_data_coverage(
+            tool_results, intent_type, issues, suggestions,
         )
+
+        # 数据驱动的需求 (行情/宏观) 只要有对应工具数据即视为已覆盖
+        for req_name in list(missing_requirements):
+            if req_name == "行情数据" and data_flags["has_price"]:
+                missing_requirements.remove(req_name)
+            elif req_name == "宏观数据" and data_flags["has_macro"]:
+                missing_requirements.remove(req_name)
+
+        req_score = (
+            (len(requirements) - len(missing_requirements)) / len(requirements)
+            if requirements else 1.0
+        )
+        if missing_requirements:
+            issues.append(f"缺少需求分析: {', '.join(missing_requirements)}")
+
+        score = 0.5 * entity_score + 0.5 * req_score - 0.2 * data_missing
+        score = max(0.0, min(1.0, score))
+
+        if data_missing and suggestions:
+            verdict = Verdict.NEEDS_MORE
+        else:
+            verdict = self._verdict_from_score(score)
+
+        return DimensionResult(
+            dimension="completeness",
+            verdict=verdict,
+            score=score,
+            issues=issues,
+            suggestions=suggestions,
+        )
+
+    @staticmethod
+    def _extract_requirements(query: str) -> dict[str, list[str]]:
+        """从查询关键词推导需求清单.
+
+        Returns:
+            {"需求名": [回答/数据中的覆盖关键词], ...}
+        """
+        query_upper = query.upper()
+        requirements: dict[str, list[str]] = {}
+        for req_name, (query_kws, answer_kws) in _REQUIREMENT_PATTERNS.items():
+            if any(kw.upper() in query_upper for kw in query_kws):
+                requirements[req_name] = answer_kws
+        return requirements
+
+    @staticmethod
+    def _check_data_coverage(
+        tool_results: list,
+        intent_type: str,
+        issues: list[str],
+        suggestions: list[dict],
+    ) -> tuple[int, dict]:
+        """数据类型覆盖检查 (意图 → 必需数据).
+
+        Returns:
+            (缺失的数据类型数量, {"has_price"/"has_knowledge"/"has_macro": bool}).
+        """
+        tool_names = " ".join(str(r.get("tool_name", "")) for r in tool_results)
+        flags = {
+            "has_price": (
+                "get_stock_price" in tool_names
+                or "get_realtime_quote" in tool_names
+            ),
+            "has_knowledge": "search_knowledge" in tool_names,
+            "has_macro": "get_macro_indicator" in tool_names,
+        }
+        missing = 0
 
         # 行情查询 → 需要价格数据
-        if intent_type == "stock_price" and not has_price_data:
+        if intent_type == "stock_price" and not flags["has_price"]:
             issues.append("缺少行情数据")
             suggestions.append({
                 "tool": "get_stock_price",
                 "reason": "需要获取股票行情数据",
             })
+            missing += 1
 
-        # 知识问答 → 需要检索结果
-        if intent_type in ("knowledge_qa", "investment_advice") and not has_knowledge:
+        # 知识问答/投资建议 → 需要检索结果
+        if intent_type in ("knowledge_qa", "investment_advice") and not flags["has_knowledge"]:
             issues.append("缺少专业知识背景")
             suggestions.append({
                 "tool": "search_knowledge",
                 "reason": "需要从知识库检索相关专业知识",
             })
+            missing += 1
 
-        # 复合意图 → 两者都需要
+        # 宏观分析 → 需要宏观指标数据
+        if intent_type == "macro_analysis" and not flags["has_macro"]:
+            issues.append("缺少宏观数据")
+            suggestions.append({
+                "tool": "get_macro_indicator",
+                "reason": "需要获取宏观指标数据",
+            })
+            missing += 1
+
+        # 复合意图 → 行情与知识都需要
         if intent_type == "complex":
-            if not has_price_data:
+            if not flags["has_price"]:
                 issues.append("缺少行情数据")
-            if not has_knowledge:
-                issues.append("缺少知识背景")
-            if not has_price_data and not has_knowledge:
                 suggestions.append({
                     "tool": "get_stock_price",
                     "reason": "获取行情数据",
                 })
+                missing += 1
+            if not flags["has_knowledge"]:
+                issues.append("缺少知识背景")
                 suggestions.append({
                     "tool": "search_knowledge",
                     "reason": "检索专业知识",
                 })
+                missing += 1
 
-        if issues:
-            return DimensionResult(
-                dimension="completeness",
-                verdict=Verdict.NEEDS_MORE if suggestions else Verdict.WEAK,
-                score=0.3,
-                issues=issues,
-                suggestions=suggestions,
-            )
-
-        return DimensionResult(
-            dimension="completeness",
-            verdict=Verdict.PASS,
-            score=0.9,
-        )
+        return missing, flags
 
     def _quick_accuracy_check(self, tool_results: list) -> DimensionResult:
         """快速数据准确性检查."""
@@ -410,6 +619,12 @@ class Verifier:
         return {
             "accuracy_score": float(acc),
             "logic_score": float(logic),
+            # 以下为可选字段 (老版 judge 可能不返回)
+            "completeness_score": (
+                float(data["completeness_score"])
+                if isinstance(data.get("completeness_score"), (int, float)) else None
+            ),
+            "missing_items": data.get("missing_items") if isinstance(data.get("missing_items"), list) else [],
             "issues": data.get("issues") if isinstance(data.get("issues"), list) else [],
             "suggestions": data.get("suggestions") if isinstance(data.get("suggestions"), list) else [],
         }

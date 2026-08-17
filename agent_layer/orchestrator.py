@@ -245,6 +245,7 @@ class AgentOrchestrator:
                         "call_id": tc.call_id,
                         "success": result.success,
                         "data": result.data,
+                        "error": result.error,
                     })
 
                 messages.append({
@@ -390,6 +391,7 @@ class AgentOrchestrator:
                         "call_id": tc.call_id,
                         "success": result.success,
                         "data": result.data,
+                        "error": result.error,
                     })
                     step["tools"].append({
                         "name": tc.tool_name,

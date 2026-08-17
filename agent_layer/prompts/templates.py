@@ -60,6 +60,8 @@ FINANCIAL_ADVISOR_PROMPT = """你是 DeepResearch Agent，专业的 AI 金融智
   beta(), alpha(), efficient_frontier(), value_at_risk(), plot_prices() 等
 - 代码中直接用这些函数，无需 import；用 print() 输出结果
 - **一次调用完成所有计算，不要拆分多次调用**
+- **执行返回 success=False 或含 error 时**: 先分析错误原因 (语法错误/变量未定义/数据为空),
+  修正代码后重新调用一次; 仍失败则如实告知用户，不要编造计算结果
 
 ### search_stocks — 搜股票
 - keyword 从用户 query 中提取关键词（如"新能源"、"白酒"、"银行"）
@@ -110,7 +112,7 @@ TOOL_USE_PROMPT = """
 4. **get_market_trend**: 市场涨跌统计、涨停跌停数、成交额。用户问"市场情绪/今天行情怎样"时调用。
 5. **get_stock_price**: 历史日线行情。symbol 用 6 位数字如 "600519"，不加后缀。日期默认最近 3 个月。
 6. **search_knowledge**: query 用原问题或关键词。返回内容中找答案，不要编造。
-7. **execute_python**: 所有计算放一次调用中完成。用 print() 输出。
+7. **execute_python**: 所有计算放一次调用中完成。用 print() 输出。执行失败 (success=False 或 error) 时先分析错误原因、修正代码重试一次；仍失败如实告知，不要编造结果。
 8. **search_stocks**: keyword 提取关键词如"新能源"、"白酒"。
 9. **get_macro_indicator**: indicator_name 用 cpi/pmi/m2/gdp/lpr。
 10. **get_north_flow**: 北向资金流向。用户问"外资/北向资金/资金面"时调用。
@@ -201,7 +203,7 @@ VERIFICATION_PROMPT = """你是一个答案质量校验器。对 Agent 生成的
 # LLM Judge 校验提示词 (准确性 + 逻辑性, 返回 JSON)
 # ================================================================
 
-VERIFICATION_JUDGE_PROMPT = """你是严格的金融答案质量评审员。请核对 Agent 回答引用的数据是否与工具结果一致，评估推理链条是否自洽。
+VERIFICATION_JUDGE_PROMPT = """你是严格的金融答案质量评审员。请核对 Agent 回答是否完整覆盖了用户需求，引用的数据是否与工具结果一致，推理链条是否自洽。
 
 ## 用户原始查询
 {query}
@@ -213,19 +215,23 @@ VERIFICATION_JUDGE_PROMPT = """你是严格的金融答案质量评审员。请�
 {tool_results}
 
 ## 评审维度
-1. **accuracy (数据准确性)**: 回答中的数字、日期、涨跌幅等是否与工具结果一致? 有无编造数据?
-2. **logic (逻辑一致性)**: 推理链条是否自洽? 有无前后矛盾?
+1. **completeness (信息完整性)**: 回答是否覆盖了用户问题中的所有需求与关键实体 (股票/指标)?
+   未覆盖的需求或实体记入 missing_items。
+2. **accuracy (数据准确性)**: 回答中的数字、日期、涨跌幅等是否与工具结果一致? 有无编造数据?
+3. **logic (逻辑一致性)**: 推理链条是否自洽? 有无前后矛盾?
 
 ## 输出要求
 只输出一个 JSON 对象 (不要输出任何其他内容):
 {{
+    "completeness_score": 0.8,
     "accuracy_score": 0.75,
     "logic_score": 0.8,
+    "missing_items": ["缺少行业地位分析"],
     "issues": ["问题1", "问题2"],
     "suggestions": ["改进建议1"]
 }}
 
-分数范围 0.0~1.0。回答与工具数据完全一致且逻辑自洽时给高分。
+分数范围 0.0~1.0。回答完整覆盖需求、数据一致且逻辑自洽时给高分。
 """
 
 

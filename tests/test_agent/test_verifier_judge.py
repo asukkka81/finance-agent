@@ -215,6 +215,102 @@ class TestRegenerationLoop:
         assert client.chat_calls == 1
 
 
+class TestCompletenessRules:
+    """规则模式完整性校验: 实体覆盖 + 需求清单 + 数据类型."""
+
+    PRICE_TOOL = [
+        {"tool_name": "get_stock_price", "success": True,
+         "data": {"summary": {"symbol": "600519", "latest_close": 1850.50}}},
+    ]
+
+    def test_full_coverage_passes(self):
+        """实体 + 需求 + 数据全部覆盖 → 高分 PASS."""
+        verifier = Verifier()
+        result = verifier.verify_final_answer(
+            "对比一下茅台和五粮液，谁更值得投资？",
+            "茅台 ROE 30%，PE 28 倍；五粮液 ROE 25%，PE 22 倍。"
+            "相比而言五粮液估值更低，更值得关注。投资有风险。",
+            self.PRICE_TOOL,
+            "stock_price",
+        )
+        dims = {d.dimension: d for d in result.dimensions}
+        comp = dims["completeness"]
+        assert comp.verdict == Verdict.PASS
+        assert comp.score == 1.0
+
+    def test_missing_entity_detected(self):
+        """查询提到两只股票但回答只提一只 → 实体缺失被检出."""
+        verifier = Verifier()
+        result = verifier.verify_final_answer(
+            "对比一下茅台和五粮液，谁更值得投资？",
+            "茅台 ROE 30%，估值合理，值得关注。",  # 没提五粮液
+            self.PRICE_TOOL,
+            "stock_price",
+        )
+        dims = {d.dimension: d for d in result.dimensions}
+        comp = dims["completeness"]
+        assert "五粮液" in " ".join(comp.issues)
+        assert comp.score < 0.8  # 实体覆盖率 50%
+
+    def test_missing_requirement_detected(self):
+        """问估值+行业地位, 回答只讲估值 → 需求缺失被检出."""
+        verifier = Verifier()
+        result = verifier.verify_final_answer(
+            "帮我分析一下茅台的估值水平和行业地位",
+            "茅台 PE 28 倍，估值处于历史中位。",  # 没讲行业地位
+            self.PRICE_TOOL,
+            "stock_price",
+        )
+        dims = {d.dimension: d for d in result.dimensions}
+        comp = dims["completeness"]
+        assert "行业地位" in " ".join(comp.issues)
+        assert comp.verdict == Verdict.WEAK
+
+    def test_missing_data_triggers_needs_more(self):
+        """数据类型缺失 → NEEDS_MORE + 补充调用建议 (原行为保留)."""
+        verifier = Verifier()
+        result = verifier.verify_after_tool_call(
+            "茅台股价", [], "stock_price",
+        )
+        assert result.needs_more_info
+        assert result.suggested_tool_calls == [
+            {"tool": "get_stock_price", "reason": "需要获取股票行情数据"},
+        ]
+
+    def test_indicator_abbrevs_not_treated_as_entities(self):
+        """PE/CPI 等指标缩写不应被误提取为股票实体."""
+        from agent_layer.core.verifier import extract_query_entities
+
+        entities = extract_query_entities("用PE和CPI分析茅台估值")
+        codes = {e["code"] for e in entities}
+        assert "PE" not in codes
+        assert "CPI" not in codes
+        assert "600519" in codes  # 茅台被正确提取
+
+    def test_judge_completeness_used(self):
+        """judge 返回 completeness_score 时直接采用."""
+        import json as _json
+
+        client = ScriptedLLMClient([LLMResponse(content=_json.dumps({
+            "completeness_score": 0.3,
+            "accuracy_score": 0.9,
+            "logic_score": 0.9,
+            "missing_items": ["缺少行业地位分析"],
+        }, ensure_ascii=False), finish_reason="stop")])
+        verifier = Verifier(use_llm=True, llm_client=client)
+
+        result = verifier.verify_final_answer(
+            "帮我分析一下茅台的估值水平和行业地位",
+            "茅台 PE 28 倍。",
+            TOOL_RESULTS,
+            "stock_price",
+        )
+        dims = {d.dimension: d for d in result.dimensions}
+        assert dims["completeness"].score == 0.3
+        assert dims["completeness"].issues == ["缺少行业地位分析"]
+        assert dims["completeness"].verdict == Verdict.FAIL
+
+
 # ================================================================
 # run_stream 回归
 # ================================================================
