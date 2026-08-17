@@ -12,11 +12,18 @@ from agent_layer.config import AgentConfig
 from agent_layer.core.executor import ExecutionResult, ToolExecutor
 from agent_layer.core.intent import Intent, IntentParser, IntentType
 from agent_layer.core.planner import Plan, Planner
-from agent_layer.core.verifier import VerificationResult, Verifier
+from agent_layer.core.verifier import (
+    VerificationResult,
+    Verifier,
+    format_tool_results_text,
+)
 from agent_layer.llm.base import BaseLLMClient, LLMResponse
 from agent_layer.mcp.registry import ToolRegistry
 from agent_layer.mcp.types import ToolCall
-from agent_layer.prompts.templates import FINANCIAL_ADVISOR_PROMPT
+from agent_layer.prompts.templates import (
+    FINANCIAL_ADVISOR_PROMPT,
+    REGENERATION_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +157,7 @@ class AgentOrchestrator:
 
         每一步工具调用或获得答案，都通过 generator yield 出来，
         让前端能实时显示思考过程。
+        最终答案会经过最终校验 (与 run 路径一致), 低分时触发重新生成。
 
         Args:
             query: 用户自然语言查询.
@@ -157,9 +165,6 @@ class AgentOrchestrator:
         Yields:
             dict: {"type": "thinking"|"tool_call"|"tool_result"|"answer"|"error", ...}
         """
-        import json
-        from datetime import datetime
-
         if not self.llm_client:
             yield {"type": "error", "message": "LLM 客户端未初始化"}
             return
@@ -177,6 +182,7 @@ class AgentOrchestrator:
         }
 
         messages = [{"role": "user", "content": query}]
+        all_results = []  # 累计全部工具执行结果 (用于最终校验)
         max_rounds = self.config.max_tool_rounds
 
         for round_num in range(1, max_rounds + 1):
@@ -207,6 +213,8 @@ class AgentOrchestrator:
                         "round": round_num,
                     }
 
+                # 每个工具只执行一次, 结果同时用于 UI 展示和 LLM 回传
+                round_results = []
                 for tc_dict in resp.tool_calls:
                     tc = ToolCall(
                         tool_name=tc_dict["name"],
@@ -221,8 +229,8 @@ class AgentOrchestrator:
                         "round": round_num,
                     }
 
-                    # 执行工具
                     result = self.registry.execute(tc)
+                    all_results.append(result)
 
                     yield {
                         "type": "tool_result",
@@ -232,23 +240,11 @@ class AgentOrchestrator:
                         "round": round_num,
                     }
 
-                # 构建 tool results 回传
-                all_tool_results = [
-                    ToolCall(
-                        tool_name=t["name"],
-                        arguments=t.get("input", t.get("arguments", {})),
-                        call_id=t.get("id", f"call_{round_num}"),
-                    )
-                    for t in resp.tool_calls
-                ]
-                round_results = []
-                for tc2 in all_tool_results:
-                    r = self.registry.execute(tc2)
                     round_results.append({
-                        "tool_name": tc2.tool_name,
-                        "call_id": tc2.call_id,
-                        "success": r.success,
-                        "data": r.data,
+                        "tool_name": tc.tool_name,
+                        "call_id": tc.call_id,
+                        "success": result.success,
+                        "data": result.data,
                     })
 
                 messages.append({
@@ -259,7 +255,7 @@ class AgentOrchestrator:
                 last_results = round_results
                 continue
 
-            # LLM 返回了最终答案
+            # LLM 返回了最终答案 → 最终校验 + 低分重答
             elapsed = (datetime.now() - t_start).total_seconds()
 
             yield {
@@ -268,15 +264,30 @@ class AgentOrchestrator:
                 "round": round_num,
             }
 
+            events: list[dict] = []
+            final_answer, verification = self._verify_and_regenerate(
+                query=query,
+                answer=resp.content,
+                tool_results=[r.to_dict() for r in all_results],
+                intent_type=intent.intent_type.value,
+                events=events,
+            )
+            yield from events
+            self._add_to_history("assistant", final_answer)
+
             yield {
                 "type": "answer",
-                "content": resp.content,
+                "content": final_answer,
+                "verification": {
+                    "passed": verification.passed,
+                    "overall_score": round(verification.overall_score, 3),
+                },
                 "elapsed": elapsed,
                 "round": round_num,
             }
             return
 
-        # 超时
+        # 达到最大轮数 — 强制生成答案 (同样走最终校验)
         yield {
             "type": "thinking",
             "content": "达到最大轮数，基于已有结果生成答案…",
@@ -292,10 +303,25 @@ class AgentOrchestrator:
         except Exception:
             answer = "抱歉，分析过于复杂，请简化您的问题。"
 
+        events = []
+        final_answer, verification = self._verify_and_regenerate(
+            query=query,
+            answer=answer,
+            tool_results=[r.to_dict() for r in all_results],
+            intent_type=intent.intent_type.value,
+            events=events,
+        )
+        yield from events
+        self._add_to_history("assistant", final_answer)
+
         elapsed = (datetime.now() - t_start).total_seconds()
         yield {
             "type": "answer",
-            "content": answer,
+            "content": final_answer,
+            "verification": {
+                "passed": verification.passed,
+                "overall_score": round(verification.overall_score, 3),
+            },
             "elapsed": elapsed,
             "round": max_rounds + 1,
         }
@@ -311,10 +337,8 @@ class AgentOrchestrator:
             1. 发送 query + tools → LLM
             2. LLM 返回 tool_calls → 执行 → 结果回传
             3. 重复直到 LLM 返回最终文本答案
+            4. 最终校验 → 低分触发重新生成 → 仍不合格则降级返回
         """
-        import json
-        from datetime import datetime
-
         t_start = datetime.now()
         tools = self.registry.get_tool_schemas()
         system_prompt = self._get_system_prompt()
@@ -401,20 +425,22 @@ class AgentOrchestrator:
                 "thinking": "基于以上工具调用结果，生成最终回答",
             })
 
-            verification = self.verifier.verify_final_answer(
-                query=query, answer=answer,
+            # 最终校验 + 低分重答
+            events: list[dict] = []
+            final_answer, verification = self._verify_and_regenerate(
+                query=query,
+                answer=answer,
                 tool_results=[r.to_dict() for r in all_results],
                 intent_type=intent.intent_type.value,
+                events=events,
             )
+            chain_of_thought.extend(events)
 
-            if not verification.passed:
-                answer = self._apply_compliance_fix(answer, verification)
-
-            self._add_to_history("assistant", answer)
+            self._add_to_history("assistant", final_answer)
 
             return AgentResponse(
                 query=query,
-                answer=answer,
+                answer=final_answer,
                 intent=intent,
                 execution=ExecutionResult(
                     success=True, results=all_results,
@@ -440,12 +466,24 @@ class AgentOrchestrator:
             "thinking": "达到最大工具轮数，基于已有结果强制生成答案",
         })
 
+        events = []
+        final_answer, verification = self._verify_and_regenerate(
+            query=query,
+            answer=answer,
+            tool_results=[r.to_dict() for r in all_results],
+            intent_type=intent.intent_type.value,
+            events=events,
+        )
+        chain_of_thought.extend(events)
+        self._add_to_history("assistant", final_answer)
+
         elapsed = (datetime.now() - t_start).total_seconds()
         return AgentResponse(
             query=query,
-            answer=answer,
+            answer=final_answer,
             intent=intent,
             execution=ExecutionResult(results=all_results),
+            verification=verification,
             elapsed_seconds=elapsed,
             chain_of_thought=chain_of_thought,
         )
@@ -617,13 +655,145 @@ class AgentOrchestrator:
         return "".join(parts)
 
     # ================================================================
+    # 最终校验 + 低分重答
+    # ================================================================
+
+    def _verify_and_regenerate(
+        self,
+        query: str,
+        answer: str,
+        tool_results: list,
+        intent_type: str,
+        events: Optional[list] = None,
+    ) -> tuple[str, VerificationResult]:
+        """最终校验 + 低分重答循环.
+
+        分数低于 min_verification_score 时, 把校验 issues 作为反馈拼进 prompt
+        重新生成答案 (最多 max_regeneration_rounds 次, 无改善则提前停止);
+        仍不合格则降级处理 (追加合规提示与问题说明, 不重写答案)。
+
+        Args:
+            events: 可选列表, 收集过程事件 (供流式场景 yield).
+
+        Returns:
+            (最终答案, 校验结果).
+        """
+        verification = self.verifier.verify_final_answer(
+            query=query,
+            answer=answer,
+            tool_results=tool_results,
+            intent_type=intent_type,
+        )
+        best_answer, best_verification = answer, verification
+
+        for attempt in range(1, self.config.max_regeneration_rounds + 1):
+            if best_verification.overall_score >= self.config.min_verification_score:
+                break
+            if not self.llm_client:
+                break
+            feedback = self._build_regeneration_prompt(
+                query, best_answer, best_verification, tool_results,
+            )
+            if not feedback:
+                break
+
+            if events is not None:
+                events.append({
+                    "type": "thinking",
+                    "content": (
+                        f"校验分数 {best_verification.overall_score:.2f} 低于阈值 "
+                        f"{self.config.min_verification_score}，"
+                        f"正在重新生成回答 (第 {attempt}/{self.config.max_regeneration_rounds} 次)…"
+                    ),
+                    "round": -1,
+                })
+
+            try:
+                resp = self.llm_client.chat(
+                    [{"role": "user", "content": feedback}],
+                    system_prompt=self._get_system_prompt(),
+                )
+            except Exception as e:
+                logger.warning("重新生成回答失败: %s", e)
+                if events is not None:
+                    events.append({
+                        "type": "thinking",
+                        "content": f"重新生成失败，使用原回答: {e}",
+                        "round": -1,
+                    })
+                break
+            candidate = (resp.content or "").strip() if resp else ""
+            if not candidate:
+                break
+
+            new_verification = self.verifier.verify_final_answer(
+                query=query,
+                answer=candidate,
+                tool_results=tool_results,
+                intent_type=intent_type,
+            )
+            if events is not None:
+                events.append({
+                    "type": "thinking",
+                    "content": (
+                        f"第 {attempt} 次重新生成完成，"
+                        f"校验分数 {new_verification.overall_score:.2f}"
+                    ),
+                    "round": -1,
+                })
+
+            if new_verification.overall_score > best_verification.overall_score:
+                best_answer, best_verification = candidate, new_verification
+            else:
+                # 无改善, 继续重试意义不大
+                logger.info(
+                    "Regeneration attempt %d did not improve score (%.2f <= %.2f)",
+                    attempt, new_verification.overall_score, best_verification.overall_score,
+                )
+                break
+
+        # 降级处理: 仍低于阈值或未通过 → 追加说明文本
+        if (
+            best_verification.overall_score < self.config.min_verification_score
+            or not best_verification.passed
+        ):
+            best_answer = self._apply_compliance_fix(best_answer, best_verification)
+
+        return best_answer, best_verification
+
+    def _build_regeneration_prompt(
+        self,
+        query: str,
+        answer: str,
+        verification: VerificationResult,
+        tool_results: list,
+    ) -> str:
+        """把校验发现的问题整理成反馈 prompt, 用于重新生成答案."""
+        issues: list[str] = []
+        for dim in verification.dimensions:
+            if dim.score >= 0.8:
+                continue
+            for item in dim.issues:
+                issues.append(f"[{dim.dimension}] {item}")
+            for sug in dim.suggestions:
+                issues.append(f"[{dim.dimension}] 建议: {sug}")
+        if not issues:
+            return ""
+        return REGENERATION_PROMPT.format(
+            query=query,
+            answer=answer[:2000],
+            issues="\n".join(f"- {i}" for i in issues[:10]),
+            tool_results=format_tool_results_text(tool_results),
+        )
+
+    # ================================================================
     # 合规修正
     # ================================================================
 
     def _apply_compliance_fix(
         self, answer: str, verification: VerificationResult
     ) -> str:
-        """根据校验结果修正答案."""
+        """根据校验结果对答案做降级修正 (追加提示文本, 不重写答案)."""
         for dim in verification.dimensions:
             if dim.dimension == "compliance" and dim.verdict.value in ("weak", "fail"):
                 # 追加风险提示
@@ -637,6 +807,13 @@ class AgentOrchestrator:
             if dim.dimension == "completeness" and dim.verdict.value in ("weak", "needs_more"):
                 if dim.issues:
                     answer += f"\n\n> ℹ️ 信息完整性提示: {'; '.join(dim.issues)}"
+
+            if dim.dimension in ("accuracy", "logic") and dim.verdict.value in ("weak", "fail"):
+                if dim.issues:
+                    answer += (
+                        f"\n\n> ℹ️ 质量校验提示 ({dim.dimension}): "
+                        f"{'; '.join(dim.issues[:3])}"
+                    )
 
         return answer
 

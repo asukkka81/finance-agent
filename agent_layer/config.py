@@ -37,6 +37,8 @@ class AgentConfig:
         "logic",          # 逻辑一致性
         "compliance",     # 合规安全性
     ])
+    min_verification_score: float = 0.7   # 最终校验分数低于该阈值时触发重新生成
+    max_regeneration_rounds: int = 2      # 最多重新生成答案的次数 (降级处理上限)
 
     # --- 系统提示词 ---
     system_prompt: str = "financial_advisor"  # 预设角色

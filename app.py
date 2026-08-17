@@ -229,13 +229,14 @@ def chat_fn(message, history):
             # 更新思考状态
             content = event.get("content", "")
             round_num = event.get("round", 0)
+            round_label = f" (第 {round_num} 轮)" if round_num >= 1 else ""
             # 累积到一个可见的 CoT 面板中
             cot_lines = []
             # 重建当前 CoT
             cot_lines.append(
                 '<details open style="margin:4px 0;font-size:0.9em;">'
                 '<summary style="cursor:pointer;font-weight:600;color:#374151;">'
-                f'🧠 正在思考… (第 {round_num} 轮)'
+                f'🧠 正在思考…{round_label}'
                 '</summary>'
                 '<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;'
                 'padding:8px 12px;margin-top:4px;max-height:240px;overflow-y:auto;">'

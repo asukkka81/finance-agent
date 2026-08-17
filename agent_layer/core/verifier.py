@@ -12,12 +12,32 @@
     - 最终答案生成后综合四维度打分 → 不合格则触发修正
 """
 
+import json
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from agent_layer.prompts.templates import VERIFICATION_JUDGE_PROMPT
+
 logger = logging.getLogger(__name__)
+
+
+def format_tool_results_text(tool_results: list, max_chars: int = 3000) -> str:
+    """将工具结果列表格式化为 LLM 可读文本 (供 judge / 重答 prompt 使用)."""
+    parts = []
+    for r in tool_results or []:
+        if not isinstance(r, dict):
+            continue
+        name = r.get("tool_name", "unknown")
+        data = r.get("data", {})
+        try:
+            text = json.dumps(data, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            text = str(data)
+        parts.append(f"[{name}] {text[:600]}")
+    return "\n".join(parts)[:max_chars]
 
 
 class Verdict(str, Enum):
@@ -60,7 +80,9 @@ class VerificationResult:
 class Verifier:
     """多轮校验器.
 
-    使用规则 + (可选) LLM 进行四维度校验。
+    completeness / compliance 使用规则校验;
+    accuracy / logic 在启用 LLM 时由 LLM judge 评审 (核对数据引用与推理链条),
+    judge 不可用时回退到规则检查。
     在校验失败时给出补充查询建议。
     """
 
@@ -121,19 +143,26 @@ class Verifier:
     ) -> VerificationResult:
         """最终答案的四维度综合校验.
 
+        accuracy / logic 维度在启用 LLM 时由 LLM judge 评审
+        (核对答案引用的数据与工具结果、检查推理链条),
+        调用失败时回退到规则检查。
+
         Returns:
             VerificationResult — 判断答案是否合规可用。
         """
         dimensions = []
 
+        # LLM judge: 一次调用同时评审准确性 + 逻辑性
+        judge = self._llm_judge(query, answer, tool_results)
+
         # 完整性
         dimensions.append(self._check_completeness(query, tool_results, intent_type))
 
         # 准确性
-        dimensions.append(self._check_accuracy(answer, tool_results))
+        dimensions.append(self._check_accuracy(answer, tool_results, judge))
 
         # 逻辑一致性
-        dimensions.append(self._check_logic(answer))
+        dimensions.append(self._check_logic(answer, judge))
 
         # 合规安全性
         dimensions.append(self._check_compliance(answer, intent_type))
@@ -245,41 +274,169 @@ class Verifier:
             score=0.9,
         )
 
-    def _check_accuracy(self, answer: str, tool_results: list) -> DimensionResult:
-        """数据准确性检查 (最终)."""
-        # 规则: 确保答案中引用的数据能在工具结果中找到
-        return DimensionResult(
-            dimension="accuracy",
-            verdict=Verdict.PASS,
-            score=0.85,
-        )
+    def _check_accuracy(
+        self,
+        answer: str,
+        tool_results: list,
+        judge: Optional[dict] = None,
+    ) -> DimensionResult:
+        """数据准确性检查 (最终).
 
-    def _check_logic(self, answer: str) -> DimensionResult:
-        """逻辑一致性检查."""
-        # 简单规则: 检查有无矛盾表述
-        contradictions = []
-
-        if "但是" in answer and "所以" in answer:
-            # 有转折+结论，需要检查是否自洽
-            pass
-
-        if "同时" in answer and "然而" in answer:
-            # 有并列+转折，可能逻辑跳跃
-            pass
-
-        if contradictions:
+        LLM judge 可用时: 核对答案引用的数字/日期与工具结果是否一致。
+        否则回退规则检查 (空答案 / 工具错误 / 无数据支撑)。
+        """
+        if judge is not None:
+            score = self._clamp_score(judge.get("accuracy_score"))
             return DimensionResult(
-                dimension="logic",
-                verdict=Verdict.WEAK,
-                score=0.6,
-                issues=contradictions,
+                dimension="accuracy",
+                verdict=self._verdict_from_score(score),
+                score=score,
+                issues=self._str_list(judge.get("issues"))[:5],
+                suggestions=self._str_list(judge.get("suggestions"))[:3],
             )
 
+        # 规则回退
+        if not answer or not answer.strip():
+            return DimensionResult(
+                dimension="accuracy", verdict=Verdict.FAIL, score=0.2,
+                issues=["答案为空"],
+            )
+        if not tool_results:
+            return DimensionResult(
+                dimension="accuracy", verdict=Verdict.WEAK, score=0.5,
+                issues=["无工具数据可供核对"],
+            )
+        for r in tool_results:
+            data = r.get("data", {}) if isinstance(r, dict) else {}
+            if isinstance(data, dict) and data.get("error"):
+                return DimensionResult(
+                    dimension="accuracy", verdict=Verdict.FAIL, score=0.2,
+                    issues=[f"工具返回错误: {data['error']}"],
+                )
         return DimensionResult(
-            dimension="logic",
-            verdict=Verdict.PASS,
-            score=0.85,
+            dimension="accuracy", verdict=Verdict.PASS, score=0.8,
         )
+
+    def _check_logic(self, answer: str, judge: Optional[dict] = None) -> DimensionResult:
+        """逻辑一致性检查 (最终).
+
+        LLM judge 可用时: 评审推理链条是否自洽。
+        否则回退规则检查 (仅能判断空答案, 深度逻辑校验依赖 LLM)。
+        """
+        if judge is not None:
+            score = self._clamp_score(judge.get("logic_score"))
+            return DimensionResult(
+                dimension="logic",
+                verdict=self._verdict_from_score(score),
+                score=score,
+                issues=self._str_list(judge.get("issues"))[:5],
+                suggestions=self._str_list(judge.get("suggestions"))[:3],
+            )
+
+        # 规则回退
+        if not answer or not answer.strip():
+            return DimensionResult(
+                dimension="logic", verdict=Verdict.FAIL, score=0.2,
+                issues=["答案为空"],
+            )
+        return DimensionResult(
+            dimension="logic", verdict=Verdict.WEAK, score=0.65,
+            issues=["未启用 LLM，逻辑一致性未深度校验"],
+        )
+
+    # ================================================================
+    # LLM Judge
+    # ================================================================
+
+    def _llm_judge(
+        self,
+        query: str,
+        answer: str,
+        tool_results: list,
+    ) -> Optional[dict]:
+        """调用 LLM 评审答案的准确性与逻辑性.
+
+        Returns:
+            {"accuracy_score": float, "logic_score": float,
+             "issues": list[str], "suggestions": list[str]}
+            或 None (未启用 / 调用失败 / 返回非法 JSON → 回退规则校验)。
+        """
+        if not (self.use_llm and self.llm_client):
+            return None
+
+        prompt = VERIFICATION_JUDGE_PROMPT.format(
+            query=query,
+            answer=answer,
+            tool_results=format_tool_results_text(tool_results),
+        )
+        try:
+            resp = self.llm_client.chat(
+                [{"role": "user", "content": prompt}],
+                system_prompt="你是严格的金融答案质量评审员，只输出 JSON。",
+            )
+        except Exception as e:
+            logger.warning("LLM judge 调用失败, 回退规则校验: %s", e)
+            return None
+
+        judge = self._parse_judge_json(resp.content if resp else "")
+        if judge is None:
+            logger.warning(
+                "LLM judge 返回非 JSON, 回退规则校验: %.80s",
+                (resp.content if resp else "")[:80],
+            )
+        return judge
+
+    @staticmethod
+    def _parse_judge_json(content: str) -> Optional[dict]:
+        """解析 judge 返回的 JSON (容忍前后多余文本)."""
+        if not content:
+            return None
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            match = re.search(r"\{.*\}", content, re.DOTALL)
+            if not match:
+                return None
+            try:
+                data = json.loads(match.group(0))
+            except (json.JSONDecodeError, TypeError):
+                return None
+        if not isinstance(data, dict):
+            return None
+        acc = data.get("accuracy_score")
+        logic = data.get("logic_score")
+        if not isinstance(acc, (int, float)) or not isinstance(logic, (int, float)):
+            return None
+        return {
+            "accuracy_score": float(acc),
+            "logic_score": float(logic),
+            "issues": data.get("issues") if isinstance(data.get("issues"), list) else [],
+            "suggestions": data.get("suggestions") if isinstance(data.get("suggestions"), list) else [],
+        }
+
+    @staticmethod
+    def _verdict_from_score(score: float) -> Verdict:
+        """分数 → 判定: >=0.8 PASS, >=0.6 WEAK, 否则 FAIL."""
+        if score >= 0.8:
+            return Verdict.PASS
+        if score >= 0.6:
+            return Verdict.WEAK
+        return Verdict.FAIL
+
+    @staticmethod
+    def _clamp_score(score) -> float:
+        """将分数钳制到 0~1."""
+        try:
+            return max(0.0, min(1.0, float(score)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _str_list(items) -> list[str]:
+        """过滤出字符串元素."""
+        if not isinstance(items, list):
+            return []
+        return [i for i in items if isinstance(i, str)]
 
     def _check_compliance(self, answer: str, intent_type: str) -> DimensionResult:
         """合规安全性检查."""
