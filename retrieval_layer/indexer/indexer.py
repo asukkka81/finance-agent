@@ -147,6 +147,21 @@ class Indexer:
 
         返回实际写入的数量。
         """
+        # 批内按 id 去重 (id 为内容哈希, 相同内容会产生相同 id,
+        # Chroma 不接受批内重复 id)
+        seen: set[str] = set()
+        unique_chunks = []
+        for c in chunks:
+            if c.id not in seen:
+                seen.add(c.id)
+                unique_chunks.append(c)
+        if len(unique_chunks) < len(chunks):
+            logger.info(
+                "Batch dedup: dropped %d duplicate-content chunks",
+                len(chunks) - len(unique_chunks),
+            )
+        chunks = unique_chunks
+
         ids = [c.id for c in chunks]
         texts = [c.content for c in chunks]
         metadatas = [c.metadata for c in chunks]

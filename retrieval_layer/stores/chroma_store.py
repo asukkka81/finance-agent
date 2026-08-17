@@ -63,20 +63,20 @@ class ChromaVectorStore(BaseVectorStore):
         documents: list[str],
         metadatas: Optional[list[dict]] = None,
     ) -> None:
-        """批量添加向量 & 文档."""
+        """批量添加向量 & 文档 (upsert 语义: 同 id 覆盖, 保证重复摄入幂等)."""
         if not ids:
             return
 
         # ChromaDB 要求向量是 list[list[float]]
         vectors_list = vectors.tolist() if isinstance(vectors, np.ndarray) else vectors
 
-        self._collection.add(
+        self._collection.upsert(
             ids=ids,
             embeddings=vectors_list,
             documents=documents,
             metadatas=metadatas,
         )
-        logger.debug("Added %d documents to ChromaDB", len(ids))
+        logger.debug("Upserted %d documents to ChromaDB", len(ids))
 
     def search(
         self,
