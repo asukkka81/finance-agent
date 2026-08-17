@@ -98,10 +98,10 @@ def _parse_date(value) -> date:
     """将各种日期格式统一转为 date 对象."""
     if value is None:
         return None
-    if isinstance(value, date):
-        return value
     if isinstance(value, datetime):
         return value.date()
+    if isinstance(value, date):
+        return value
     if isinstance(value, str):
         # 尝试多种格式
         for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d", "%m/%d/%Y"):
