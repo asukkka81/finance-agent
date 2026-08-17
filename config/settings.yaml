@@ -1,0 +1,69 @@
+# ============================================
+# Finance Agent — 全局配置
+# ============================================
+
+database:
+  path: "data/finance.db"
+  # SQLite pragma 参数
+  pragma:
+    journal_mode: "WAL"
+    foreign_keys: "ON"
+    synchronous: "NORMAL"
+    cache_size: -64000  # 64MB 内存缓存
+
+data_sources:
+  yfinance:
+    timeout: 30
+    retry_count: 3
+    retry_delay: 5  # seconds
+
+  akshare:
+    timeout: 60
+    retry_count: 3
+    retry_delay: 3
+
+sync:
+  # 默认关注的股票
+  us_symbols:
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - NVDA
+    - META
+    - TSLA
+    - BRK-B
+    - JPM
+    - V
+
+  cn_symbols:
+    - "600519"  # 贵州茅台
+    - "000858"  # 五粮液
+    - "000001"  # 平安银行
+    - "600036"  # 招商银行
+    - "601318"  # 中国平安
+    - "300750"  # 宁德时代
+    - "002594"  # 比亚迪
+    - "601899"  # 紫金矿业
+    - "600276"  # 恒瑞医药
+    - "000333"  # 美的集团
+
+  # 默认关注的基金
+  fund_codes:
+    - "510300"  # 沪深300ETF
+    - "510050"  # 上证50ETF
+    - "159915"  # 创业板ETF
+    - "000001"  # 华夏成长混合
+
+  # 默认拉取的宏观指标
+  macro_indicators:
+    - "cpi"           # 居民消费价格指数
+    - "pmi"           # 制造业PMI
+    - "m2"            # M2货币供应量
+    - "lpr"           # 贷款市场报价利率
+    - "gdp"           # 国内生产总值
+    - "social_financing"  # 社会融资规模
+
+logging:
+  level: "INFO"
+  format: "[%(asctime)s] %(levelname)s [%(name)s] %(message)s"

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 测试与工具缓存
+.pytest_cache/
+.ipynb_checkpoints/
+.ruff_cache/
+
+# 数据文件（可通过同步脚本/下载脚本重新生成）
+data/
+
+# 模型训练产物
+outputs/
+
+# Claude Code 本地设置
+.claude/
+
+# macOS
+.DS_Store
