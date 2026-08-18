@@ -271,3 +271,75 @@ def register_data_tools(
         "Registered %d data tools: %s",
         4, ["get_stock_price", "search_stocks", "get_macro_indicator", "get_market_overview"],
     )
+
+
+def register_sql_tool(registry: ToolRegistry, db_path: str = "data/finance.db") -> None:
+    """将 Text2SQL 引擎注册为 MCP 工具 (execute_sql).
+
+    直接对本地 SQLite 数据库执行 SELECT 查询, 返回结构化结果。
+    对应 Agent 五大工具之: 数据库查询工具 (ToolRole.TEXT2SQL)。
+
+    安全限制:
+        - 仅允许 SELECT / WITH 开头的只读查询
+        - 结果最多返回 100 行
+        - 查询超时由 SQLite busy timeout 兜底
+    """
+    import sqlite3
+
+    def _execute_sql(query: str) -> dict:
+        """执行只读 SQL 查询."""
+        stripped = query.strip()
+        if not stripped:
+            return {"error": "空查询", "rows": [], "row_count": 0}
+
+        # 只读白名单: 仅 SELECT / WITH
+        head = stripped.upper()
+        if not (head.startswith("SELECT") or head.startswith("WITH")):
+            return {
+                "error": "仅允许只读 SELECT 查询 (禁止 INSERT/UPDATE/DELETE/DDL)",
+                "rows": [], "row_count": 0,
+            }
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(stripped + " LIMIT 100")
+            rows = [dict(r) for r in cur.fetchmany(100)]
+            columns = [d[0] for d in cur.description] if cur.description else []
+            return {
+                "columns": columns,
+                "rows": rows,
+                "row_count": len(rows),
+            }
+        except Exception as e:
+            return {"error": f"SQL 执行失败: {e}", "rows": [], "row_count": 0}
+        finally:
+            conn.close()
+
+    @registry.register(
+        name="execute_sql",
+        description=(
+            "对本地金融数据库执行 SQL 查询 (只读 SELECT)。"
+            "数据库含 stocks 表 (股票代码/名称/行业) 和 daily_prices 表 "
+            "(日线行情: 开高低收/成交量/涨跌幅/换手率, 前复权, 2023-08 至今, 10 只 A 股)。"
+            "适用: 统计类问题 (最高/最低/平均值/排名/天数统计)、跨股票对比。"
+            "示例: SELECT s.symbol, s.name, dp.trade_date, dp.close FROM daily_prices dp "
+            "JOIN stocks s ON dp.stock_id=s.id WHERE s.symbol='600519' "
+            "AND dp.trade_date BETWEEN '2024-01-01' AND '2024-12-31' ORDER BY dp.trade_date;"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "只读 SQL 查询语句 (仅 SELECT/WITH)",
+                },
+            },
+            "required": ["query"],
+        },
+        role=ToolRole.TEXT2SQL,
+    )
+    def execute_sql(query: str) -> dict:
+        return _execute_sql(query)
+
+    logger.info("Registered sql tool: execute_sql (Text2SQL)")
