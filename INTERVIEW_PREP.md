@@ -35,6 +35,7 @@ Agent 层: 意图解析(规则) ──► ReAct 循环 (LLM ⇄ 8+ MCP 工具, �
 
 ### 真实实现
 
+- **口径注意（2026-08-23 复核）**：本项目是自研的 MCP *风格* 工具注册中心（装饰器注册 → JSON Schema → 统一执行），**不是官方 MCP 协议实现**（仓库无 mcp SDK、无 JSON-RPC、无 stdio/SSE transport）。面试表述建议："参考 MCP 理念自研的工具注册与调度机制"，避免被懂协议细节的面试官追问 JSON-RPC/handshake 时被动。
 - MCP 工具注册：`agent_layer/mcp/registry.py`（`register` 装饰器 → 名称/描述/JSON Schema/角色注册）
 - ReAct 循环：`agent_layer/orchestrator.py` 的 `_run_with_llm()`：
   ```
@@ -66,7 +67,7 @@ for round_num in range(1, max_rounds + 1):
 ### 面试问答
 
 - **Q: 为什么用 MCP 协议而不是直接函数调用？**
-  A: ① 工具接口标准化（统一 JSON Schema 描述），LLM 工具选择与执行解耦；② 工具可插拔——数据/检索/沙箱/实时工具都是运行时注册，新增数据源只需 `@registry.register`；③ 与业界 Agent 生态对齐（Claude/各类 Agent 框架同协议）。
+  A（口径先行）：实际实现是**自研的 MCP 风格注册中心**（非官方协议），回答时可说"借鉴 MCP 理念"：① 工具接口标准化（统一 JSON Schema 描述），LLM 工具选择与执行解耦；② 工具可插拔——数据/检索/沙箱/实时工具都是运行时注册，新增数据源只需 `@registry.register`；③ 与业界 Agent 生态理念对齐（Claude/各类 Agent 框架同思路）。若被追问"为什么不直接用官方 MCP SDK"：本地单机单进程场景，JSON-RPC/进程间 transport 无实际收益，轻量注册中心够用；换官方 SDK 只差一层 adapter。
 - **Q: ReAct 循环会不会死循环？**
   A: 三重防护——`max_tool_rounds=6` 硬上限；超轮数强制要求 LLM 基于已有结果作答；沙箱 30s 超时、SQL 只读限制。评测中最多跑满 6 轮后强制收尾。
 - **Q: 多跳推理怎么体现？**
@@ -101,6 +102,8 @@ def _rrf_fusion(self, dense_results, sparse_results, k=60):
 
 ### 面试问答
 
+- **Q: Reranker 的原理是什么？为什么它比向量检索准？**
+  A: 召回用的 BGE 向量模型是**双编码器**（bi-encoder）——query 和 doc 各自独立编码成 512 维向量，最后只做一次余弦点积，编码过程无交互，细粒度匹配信号（同义改写/词序/否定）全丢。Reranker 是**交叉编码器**（cross-encoder）——`[CLS] query [SEP] doc [SEP]` 拼成一条序列过一次 transformer，query 每个 token 与 doc 每个 token 直接交叉注意力，CLS 向量过分类头 `sigmoid(W·h+b)` 输出 0~1 相关性。交互充分所以准；但每对 (query, doc) 都要完整前向、无法预计算，所以只能两段式：bi-encoder O(1) 召回 top-N → cross-encoder 精排。实现细节：BAAI/bge-reranker-base（约 278M，FlagEmbedding 的 FlagReranker，fp16），`compute_score(pairs, normalize=True)` 批量 sigmoid 打分，原分数存 original_score 可追溯，FlagEmbedding 缺失时身份重排降级（`reranker.py`）。
 - **Q: 为什么不用纯向量检索？**
   A: 金融领域强术语依赖（"600519"、PE/ROE、专有名词），纯语义容易漏召回；BM25 关键词精确匹配补上术语类查询。评测里"夏普比率"类查询两路都命中（match_type=both）。
 - **Q: RRF 为什么比加权融合好？**
@@ -206,7 +209,7 @@ for attempt in range(1, config.max_regeneration_rounds + 1):
   2. 工具调度（调用工具名是否合法/合理）
   3. 代码质量（危险 import/函数模式检测——复用沙箱扫描器）
   4. 答案质量（长度/结构启发式）
-- 训练数据：DISC-FinLLM 357 条（复旦专家数据集：咨询/计算/检索/任务四类）+ Text2SQL 401 条；数据分工设计：SFT 用 DISC（模仿语料），GRPO 用博金 1000 问 + 官方库验证（客观奖励），评测用 holdout——**三集不重叠**
+- 训练数据：DISC-FinLLM 357 条（复旦专家数据集：咨询/计算/检索/任务四类）+ Text2SQL 401 条；数据分工设计：SFT 用 DISC（模仿语料），GRPO 用博金 1000 问（**规划**接官方库验证提供客观奖励——当前奖励为字符串启发式，未接库执行），评测用 holdout——**三集不重叠**
 - **诚实口径（面试必须准备）**：管线与数据就绪，真实训练尚未执行（需 A100 级 GPU）；奖励函数当前是字符串启发式，规划接入真实 Agent 执行结果作为奖励
 
 ### 面试问答
@@ -227,8 +230,13 @@ for attempt in range(1, config.max_regeneration_rounds + 1):
 | 声明 | 实测证据 |
 |---|---|
 | 数十分钟 → 分钟级 | 10 问评测：最快 13.5s（知识问答），最慢 211s（多跳计算），均值约 2 分钟；对比人工投顾咨询数十分钟起 |
+| 四维质检通过率 90% | 10 问中 9 问 passed（Q7 未通过被降级标注），通过问答平均质检分 0.88 |
+| 工具协同调度 | 10 问均经工具求解、最长 4 步依赖链（Q6 行情→沙箱→行情→沙箱）；47 次调用 39 次成功，失败经错误回传自动重试恢复。⚠️ 不建议简历写"工具调用率"——调用多≠质量好（Q4 达 14 次含重试），且知识问答类本可不调工具，100% 反而可被质疑过度调用；工具能力用"多跳依赖链"体现，成功率故事留面试讲 |
+| 拦截幻觉 2 起 | Q7 编造低点 136.82（真实 130.70）→ 重答 2 次后降级；Q1 日期错位被 completeness 校验捕获。诚实边界：Q6 自洽性编造被放行（已列修复计划） |
 | 多跳推理 | Q2 波动率：行情→SQL→沙箱 3 步依赖链；Q6：行情→沙箱→行情→沙箱 4 步 |
 | 全链路基建 | 7240 行行情（10 只 A 股×3 年，新浪源前复权）；1100+ 检索文档；401 条验证样本 |
+
+**简历口径提醒（成效条目）**：写"拦截/捕获 N 起幻觉事件"而非"幻觉率降低 X%"——样本量 10 问无统计意义且无对照组基线；被问"10 个样本的 90% 有意义吗"→ 答"10 类按场景覆盖设计，口径是场景评测而非 benchmark"。
 
 ### 面试问答
 
@@ -241,6 +249,8 @@ for attempt in range(1, config.max_regeneration_rounds + 1):
 
 | 简历表述 | 实际状态 | 建议口径 |
 |---|---|---|
+| "基于 MCP 协议实现" | 自研 MCP 风格注册中心，非官方协议（无 SDK/JSON-RPC/transport） | "参考 MCP 理念自研工具注册与调度机制"（详见第 1 节） |
+| "以 Qwen3-14B 为基座" | 运行时 Agent 实际由 **qwen-plus API** 驱动（`scripts/run_agent_eval.py:105`）；Qwen3-14B 只是 SFT/GRPO 的目标基座，且训练未执行（无 checkpoint）；`model_layer/config.py` 当前写的是 **Qwen2.5-14B-Instruct**，跑训练前需统一为 Qwen3-14B | "基于 Qwen 系列模型（评测由 qwen-plus API 驱动 ReAct 循环）；SFT/GRPO 训练管线以 Qwen3-14B 为目标基座" |
 | 覆盖"持仓分析" | ❌ 无持仓数据/功能（无用户组合表） | "系统设计目标包含持仓分析，当前版本聚焦行情/知识/计算，持仓模块在规划中" |
 | "风险评估" | △ 合规校验的风险提示 + 需求清单风险维度，无完整风险评估模型 | "风险评估通过合规校验和风险提示实现，覆盖'不构成投资建议'等红线" |
 | "降低内容幻觉" | 设计目标；评测显示 judge 能识别大部分但仍有放行 | "自评闭环显著提升幻觉识别率，10 场景评测中捕获数据编造/日期错位等案例；仍存在改进空间（已列修复计划）" |
